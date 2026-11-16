@@ -760,8 +760,11 @@ def api_delete(sid):
 
     sdir = os.path.join(UPLOAD_DIR, str(s['user_id']), str(sid))
     try:
-        # Stop first. If the process is already gone, continue with orphan cleanup.
-        runner.stop_script(sid)
+        # Stop and verify the complete process group before deleting files.
+        # Never remove the record/folder when a bot process could still be alive.
+        stopped, stop_message = runner.stop_script(sid)
+        if not stopped and stop_message != "Not running":
+            return jsonify({'ok': False, 'error': stop_message}), 502
         # Always inspect/delete the Backblaze B2 prefix, even when the Firestore
         # storage_path field is blank or stale (older uploads often had this).
         if not storage_helper.delete_script_folder(s['user_id'], sid):
