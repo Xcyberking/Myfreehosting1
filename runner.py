@@ -601,6 +601,107 @@ def _auto_install(module, file_type, cwd, user_id, log_file=None):
         return False
 
 
+
+
+def discover_untracked_processes():
+    """Find bot processes still running from this app's uploads tree, even if
+    their Firestore record or in-memory RUNNING entry is gone."""
+    found = {}
+    try:
+        from app import UPLOAD_DIR
+        root = os.path.realpath(UPLOAD_DIR)
+        for proc in psutil.process_iter(['pid', 'ppid', 'cmdline', 'create_time', 'name']):
+            try:
+                pid = int(proc.info['pid'])
+                if pid == os.getpid():
+                    continue
+                cmdline = proc.info.get('cmdline') or []
+                joined = ' '.join(str(x) for x in cmdline)
+                if not joined:
+                    continue
+                # Only match command arguments that resolve inside this app's
+                # own uploads directory; do not expose or stop unrelated services.
+                matched = None
+                for arg in cmdline:
+                    try:
+                        candidate = os.path.realpath(str(arg))
+                        if os.path.commonpath([root, candidate]) == root and candidate != root:
+                            rel = os.path.relpath(candidate, root)
+                            parts = rel.split(os.sep)
+                            if len(parts) >= 3:
+                                matched = (parts[0], parts[1], candidate)
+                                break
+                    except (ValueError, OSError):
+                        continue
+                if not matched:
+                    continue
+                user_id, script_id, script_path = matched
+                try:
+                    pgid = os.getpgid(pid) if os.name != 'nt' else None
+                except Exception:
+                    pgid = None
+                key = f"{user_id}:{script_id}:{pgid or pid}"
+                item = found.setdefault(key, {
+                    "user_id": user_id, "script_id": script_id,
+                    "pid": pid, "process_group_id": pgid,
+                    "processes": [], "command": joined[:300],
+                    "started_at": proc.info.get('create_time')
+                })
+                item["processes"].append(pid)
+                if pid < item["pid"]:
+                    item["pid"] = pid
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    except Exception as exc:
+        print(f"[RUNNER] Orphan scan failed: {exc}", flush=True)
+    return list(found.values())
+
+
+def stop_untracked_process(user_id, script_id, process_group_id, pid):
+    """Stop a discovered group only after revalidating its command belongs to
+    this application's uploads directory."""
+    try:
+        matches = discover_untracked_processes()
+        target = next((x for x in matches
+                       if x["user_id"] == str(user_id)
+                       and x["script_id"] == str(script_id)
+                       and str(x.get("process_group_id")) == str(process_group_id)
+                       and int(x["pid"]) == int(pid)), None)
+        if not target:
+            return False, "Process no longer exists or could not be verified"
+        pgid = target.get("process_group_id")
+        if os.name != "nt" and pgid:
+            try:
+                os.killpg(int(pgid), signal.SIGTERM)
+            except ProcessLookupError:
+                return True, "Already stopped"
+            import time
+            deadline = time.time() + 5
+            while time.time() < deadline and _process_group_alive(pgid):
+                time.sleep(0.15)
+            if _process_group_alive(pgid):
+                os.killpg(int(pgid), signal.SIGKILL)
+            if _process_group_alive(pgid):
+                return False, "Process group is still alive"
+            return True, "Stopped"
+        parent = psutil.Process(int(pid))
+        children = parent.children(recursive=True)
+        for child in children:
+            try: child.terminate()
+            except Exception: pass
+        try: parent.terminate()
+        except Exception: pass
+        _, alive = psutil.wait_procs([parent] + children, timeout=4)
+        for process in alive:
+            try: process.kill()
+            except Exception: pass
+        return True, "Stopped"
+    except psutil.NoSuchProcess:
+        return True, "Already stopped"
+    except Exception as exc:
+        return False, str(exc)
+
+
 def cleanup_all():
     for sid in list(RUNNING.keys()):
         try:
