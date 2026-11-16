@@ -4,6 +4,7 @@ import sys
 import re
 import subprocess
 import threading
+import signal
 from datetime import datetime
 
 import psutil
@@ -289,6 +290,21 @@ def start_script(script_id, user_id, file_path, file_type, env_vars=None):
             stdin=subprocess.DEVNULL, env=child_env, **kwargs
         )
 
+        # Persist the PID and process-group ID immediately. The process group
+        # survives the web worker's in-memory RUNNING dictionary and lets Delete
+        # reliably terminate detached descendants before removing their files.
+        try:
+            from db import update_script
+            update_script(script_id, {
+                "running": True, "status": "running",
+                "process_pid": int(proc.pid),
+                "process_group_id": int(proc.pid) if os.name != "nt" else None,
+                "process_started_at": datetime.now().isoformat()
+            })
+        except Exception as exc:
+            log_file.write(f"[SYSTEM] Could not persist process identity: {exc}\\n")
+            log_file.flush()
+
         with LOCK:
             RUNNING[script_id] = {
                 'proc': proc,
@@ -332,45 +348,111 @@ def _watch_exit(script_id, proc):
         print(f'[RUNNER] Exit watcher error for {script_id}: {exc}', flush=True)
 
 
+def _process_group_alive(pgid):
+    if not pgid or os.name == "nt":
+        return False
+    try:
+        os.killpg(int(pgid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
 def stop_script(script_id):
+    # RUNNING is process-local. Read the durable PID/PGID from Firestore too,
+    # because the web request and the launcher may be handled by different workers,
+    # or the bot's parent process may have exited while a child remains alive.
     with LOCK:
         info = RUNNING.get(script_id)
-    if not info:
+
+    record = None
+    try:
+        from db import get_script, update_script
+        record = get_script(script_id) or {}
+    except Exception:
+        record = {}
+
+    proc = info.get('proc') if info else None
+    pid = (proc.pid if proc else None) or record.get('process_pid')
+    pgid = record.get('process_group_id') or (pid if pid and os.name != "nt" else None)
+    user_id = (info or {}).get('user_id') or record.get('user_id')
+
+    if not pid and not pgid:
         return False, "Not running"
 
-    pid = info['proc'].pid
     try:
-        parent = psutil.Process(pid)
-        children = parent.children(recursive=True)
-        for ch in children:
-            try: ch.terminate()
-            except Exception: pass
-        try: parent.terminate()
-        except Exception: pass
-        gone, alive = psutil.wait_procs([parent] + children, timeout=3)
-        for p in alive:
-            try: p.kill()
-            except Exception: pass
-    except psutil.NoSuchProcess:
-        pass
-    except Exception as e:
-        return False, f"Error stopping: {e}"
+        # Bots are launched in a new session, so terminate the complete process
+        # group, including descendants that outlive the original Python/Node parent.
+        if os.name != "nt" and pgid:
+            try:
+                os.killpg(int(pgid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                return False, f"Permission denied stopping bot process group: {exc}"
+            import time
+            deadline = time.time() + 5
+            while time.time() < deadline and _process_group_alive(pgid):
+                time.sleep(0.15)
+            if _process_group_alive(pgid):
+                try:
+                    os.killpg(int(pgid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                deadline = time.time() + 3
+                while time.time() < deadline and _process_group_alive(pgid):
+                    time.sleep(0.15)
+            if _process_group_alive(pgid):
+                return False, "Bot process group is still alive; files were not deleted"
+        elif pid:
+            try:
+                parent = psutil.Process(int(pid))
+                children = parent.children(recursive=True)
+                for child in children:
+                    try: child.terminate()
+                    except Exception: pass
+                try: parent.terminate()
+                except Exception: pass
+                _, alive = psutil.wait_procs([parent] + children, timeout=3)
+                for process in alive:
+                    try: process.kill()
+                    except Exception: pass
+            except psutil.NoSuchProcess:
+                pass
+    except Exception as exc:
+        return False, f"Error stopping bot: {exc}"
+
     sync_ok = True
     sync_error = ""
     try:
-        # Upload the final session/database/log changes before app.py clears the
-        # temporary Render working directory.
         from storage_helper import sync_script_folder
-        sync_ok = sync_script_folder(os.path.dirname(info['log_file'].name), info.get('user_id'), script_id, prune=True)
-        if not sync_ok:
-            sync_error = "Backblaze B2 sync was incomplete"
+        from app import UPLOAD_DIR
+        script_dir = os.path.join(UPLOAD_DIR, str(user_id), str(script_id))
+        if os.path.isdir(script_dir):
+            sync_ok = sync_script_folder(script_dir, user_id, script_id, prune=True)
+            if not sync_ok:
+                sync_error = "Backblaze B2 sync was incomplete"
     except Exception as exc:
         sync_ok = False
         sync_error = str(exc)
     finally:
         _cleanup(script_id)
+
     if not sync_ok:
         return False, f"Bot stopped, but local files were kept: {sync_error}"
+    try:
+        from db import update_script
+        update_script(script_id, {
+            "running": False, "status": "stopped",
+            "process_pid": None, "process_group_id": None,
+            "process_started_at": None
+        })
+    except Exception:
+        pass
     return True, "Stopped"
 
 
