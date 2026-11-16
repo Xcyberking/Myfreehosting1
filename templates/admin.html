@@ -38,7 +38,22 @@
     </div>
 </div>
 
+
 {% include '_storage_monitor.html' %}
+
+<!-- ORPHAN / UNTRACKED BOT PROCESSES -->
+<div class="card" id="orphanProcessCard">
+    <div class="row-between">
+        <div>
+            <h3 style="margin:0;">⚠️ Hidden / untracked running bots</h3>
+            <p class="muted small" style="margin:6px 0 0;">Scan this hosting instance for bot processes that are still running but are missing from the normal bot list.</p>
+        </div>
+        <button class="btn btn-primary btn-sm" id="scanOrphansBtn" onclick="scanOrphanProcesses()">Scan</button>
+    </div>
+    <div id="orphanProcessStatus" class="muted small" style="margin-top:12px;">Tap Scan to find orphan processes on this server.</div>
+    <div id="orphanProcessList" style="display:flex;flex-direction:column;gap:10px;margin-top:10px;"></div>
+</div>
+
 
 <!-- FULL DATA RESET: ADMIN ONLY -->
 <div class="card" style="border:1px solid rgba(239,68,68,.55);background:rgba(239,68,68,.045);">
@@ -256,6 +271,73 @@ async function clearAllHostingData() {
         status.style.color = '#ef4444';
         clearAllButton.disabled = clearAllInput.value.trim() !== 'CLEAR ALL DATA';
         clearAllButton.innerHTML = '<svg class="ic ic-sm"><use href="#i-trash"/></svg> Retry permanent clear';
+    }
+}
+
+
+async function scanOrphanProcesses() {
+    const button = document.getElementById('scanOrphansBtn');
+    const status = document.getElementById('orphanProcessStatus');
+    const list = document.getElementById('orphanProcessList');
+    button.disabled = true;
+    status.textContent = 'Scanning this server…';
+    list.replaceChildren();
+    try {
+        const response = await fetch('/admin/orphan-processes', {cache:'no-store'});
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || 'Scan failed');
+        if (!data.processes.length) {
+            status.textContent = 'No untracked bot processes found on this hosting instance.';
+            return;
+        }
+        status.textContent = data.processes.length + ' untracked process group(s) found.';
+        for (const item of data.processes) {
+            const card = document.createElement('div');
+            card.style.cssText = 'padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--bg-1);';
+            const title = document.createElement('strong');
+            title.textContent = item.bot_name + (item.known_record ? '' : ' · DB record missing');
+            const detail = document.createElement('div');
+            detail.className = 'muted small';
+            detail.style.cssText = 'margin:6px 0;word-break:break-all;';
+            detail.textContent = 'Owner: ' + item.owner_name + ' (' + item.user_id + ') · Bot ID: ' + item.script_id +
+                ' · PID: ' + item.pid + ' · Group: ' + (item.process_group_id ?? 'N/A') +
+                ' · Processes: ' + item.processes.join(', ');
+            const command = document.createElement('div');
+            command.className = 'muted small';
+            command.style.cssText = 'margin-bottom:8px;word-break:break-all;';
+            command.textContent = item.command || '';
+            const stop = document.createElement('button');
+            stop.className = 'btn btn-danger btn-sm';
+            stop.style.width = '100%';
+            stop.textContent = 'Stop this hidden bot';
+            stop.addEventListener('click', async () => {
+                if (!confirm('Stop this process group? Only processes verified as belonging to this app uploads folder will be stopped.')) return;
+                stop.disabled = true;
+                try {
+                    const r = await fetch('/admin/orphan-processes/stop', {
+                        method:'POST',
+                        headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},
+                        body:JSON.stringify({
+                            user_id:item.user_id, script_id:item.script_id,
+                            process_group_id:item.process_group_id, pid:item.pid
+                        })
+                    });
+                    const result = await r.json();
+                    if (!r.ok || !result.ok) throw new Error(result.message || result.error || 'Stop failed');
+                    status.textContent = result.message;
+                    await scanOrphanProcesses();
+                } catch (e) {
+                    alert('Could not stop process: ' + e.message);
+                    stop.disabled = false;
+                }
+            });
+            card.append(title, detail, command, stop);
+            list.append(card);
+        }
+    } catch (e) {
+        status.textContent = 'Scan error: ' + e.message;
+    } finally {
+        button.disabled = false;
     }
 }
 
