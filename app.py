@@ -998,6 +998,38 @@ def admin_clear_all_data():
 
 
 
+@app.route('/admin/orphan-processes')
+@admin_required
+def admin_orphan_processes():
+    """List bot processes found on this hosting instance but not tracked normally."""
+    try:
+        items = runner.discover_untracked_processes()
+        for item in items:
+            record = db.get_script(item['script_id'])
+            item['known_record'] = bool(record)
+            item['bot_name'] = (record or {}).get('name') or 'Untracked / deleted bot'
+            item['owner_name'] = ((db.get_user(item['user_id']) or {}).get('name')
+                                  or item['user_id'])
+        return jsonify({'ok': True, 'processes': items})
+    except Exception as exc:
+        app.logger.exception('Orphan process scan failed')
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+
+
+@app.route('/admin/orphan-processes/stop', methods=['POST'])
+@admin_required
+def admin_stop_orphan_process():
+    data = request.get_json(silent=True) or {}
+    required = ('user_id', 'script_id', 'process_group_id', 'pid')
+    if any(data.get(key) in (None, '') for key in required):
+        return jsonify({'ok': False, 'error': 'Missing process identity'}), 400
+    ok, message = runner.stop_untracked_process(
+        str(data['user_id']), str(data['script_id']),
+        data['process_group_id'], data['pid']
+    )
+    return jsonify({'ok': ok, 'message': message}), (200 if ok else 409)
+
+
 @app.route('/admin')
 @admin_required
 def admin_dashboard():
