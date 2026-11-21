@@ -217,13 +217,19 @@ def _callback(appmod, data, chat_id):
                 db.update_script(ident, {"running": False, "status": "stopped"})
             send_message(appmod, ("⏹ " if ok else "⚠️ ") + str(msg), chat_id=chat_id)
         elif action == "delete":
-            appmod.runner.stop_script(ident)
-            if s.get("storage_path") and not appmod.storage_helper.delete_script_folder(uid, ident):
-                return send_message(appmod, "Firebase Storage delete fail hui; record rakha hai.", chat_id=chat_id)
+            stopped, stop_message = appmod.runner.stop_script(ident)
+            if not stopped and stop_message != "Not running":
+                return send_message(appmod, "Bot stop nahi hua; safety ke liye files delete nahi ki. " + str(stop_message), chat_id=chat_id)
+            # Always purge the complete B2 prefix, including historical versions.
+            if not appmod.storage_helper.delete_script_folder(uid, ident):
+                return send_message(appmod, "Cloud ke purane versions delete verify nahi hue; bot record safe rakha hai. Backblaze permissions check karein.", chat_id=chat_id)
             import shutil
-            shutil.rmtree(sdir, ignore_errors=True)
+            if os.path.isdir(sdir):
+                shutil.rmtree(sdir)
+            if os.path.exists(sdir):
+                return send_message(appmod, "Local folder delete nahi hua; bot record safe rakha hai.", chat_id=chat_id)
             db.delete_script(ident)
-            send_message(appmod, f"🗑 Deleted: {s.get('name')}", chat_id=chat_id)
+            send_message(appmod, f"🗑 Deleted: {s.get('name')} — bot stopped aur local/cloud files remove kar di gayi.", chat_id=chat_id)
         return
     if area == "payment":
         p = db.get_payment(ident)
