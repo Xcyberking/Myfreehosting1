@@ -382,7 +382,23 @@ def stop_script(script_id):
     user_id = (info or {}).get('user_id') or record.get('user_id')
 
     if not pid and not pgid:
-        return False, "Not running"
+        # The website record can outlive (or lose) its PID metadata while the
+        # child bot process keeps running. Fall back to the app-scoped process
+        # scanner before declaring it stopped or allowing Delete to continue.
+        try:
+            orphan = next((
+                item for item in discover_untracked_processes()
+                if str(item.get("script_id")) == str(script_id)
+                and (not user_id or str(item.get("user_id")) == str(user_id))
+            ), None)
+        except Exception as exc:
+            return False, f"Could not verify bot process state: {exc}"
+        if orphan:
+            pid = orphan.get("pid")
+            pgid = orphan.get("process_group_id") or (pid if os.name != "nt" else None)
+            user_id = orphan.get("user_id") or user_id
+        else:
+            return False, "Not running"
 
     try:
         # Bots are launched in a new session, so terminate the complete process
