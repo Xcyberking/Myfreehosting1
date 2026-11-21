@@ -622,6 +622,9 @@ def discover_untracked_processes():
                 # Only match command arguments that resolve inside this app's
                 # own uploads directory; do not expose or stop unrelated services.
                 matched = None
+                # Prefer the explicit script path in argv. This still works
+                # after the file is unlinked: realpath/commonpath do not need
+                # the target file to exist.
                 for arg in cmdline:
                     try:
                         candidate = os.path.realpath(str(arg))
@@ -633,6 +636,27 @@ def discover_untracked_processes():
                                 break
                     except (ValueError, OSError):
                         continue
+
+                # Some Python/Node bots keep only a relative script argument.
+                # Their working directory remains inside uploads/<uid>/<sid>.
+                # Restrict this fallback to Python/Node executables so package
+                # installers or unrelated helper processes are not treated as bots.
+                if not matched:
+                    try:
+                        cwd = os.path.realpath(proc.cwd())
+                        process_name = str(proc.info.get('name') or '').lower()
+                        is_bot_runtime = (
+                            'python' in process_name or 'node' in process_name
+                            or any(('python' in str(x).lower() or 'node' in str(x).lower())
+                                   for x in cmdline[:2])
+                        )
+                        if is_bot_runtime and os.path.commonpath([root, cwd]) == root and cwd != root:
+                            rel = os.path.relpath(cwd, root)
+                            parts = rel.split(os.sep)
+                            if len(parts) >= 2:
+                                matched = (parts[0], parts[1], cwd)
+                    except (ValueError, OSError, psutil.Error):
+                        pass
                 if not matched:
                     continue
                 user_id, script_id, script_path = matched
@@ -644,10 +668,16 @@ def discover_untracked_processes():
                 item = found.setdefault(key, {
                     "user_id": user_id, "script_id": script_id,
                     "pid": pid, "process_group_id": pgid,
-                    "processes": [], "command": joined[:300],
+                    "processes": [], "command": joined[:500],
+                    "process_names": [], "working_directories": [],
                     "started_at": proc.info.get('create_time')
                 })
                 item["processes"].append(pid)
+                item["process_names"].append(str(proc.info.get('name') or 'unknown'))
+                try:
+                    item["working_directories"].append(proc.cwd())
+                except Exception:
+                    pass
                 if pid < item["pid"]:
                     item["pid"] = pid
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
