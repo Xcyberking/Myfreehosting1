@@ -42,6 +42,18 @@ _CLIENT_LOCK = threading.Lock()
 _USAGE_LOCK = threading.Lock()
 _USAGE_CACHE = {"at": 0.0, "data": None}
 LAST_ERROR = ""
+_SCRIPT_LOCKS = {}
+_SCRIPT_LOCKS_LOCK = threading.Lock()
+
+
+def _script_lock(user_id, script_id):
+    key = (str(user_id), str(script_id))
+    with _SCRIPT_LOCKS_LOCK:
+        lock = _SCRIPT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _SCRIPT_LOCKS[key] = lock
+        return lock
 
 
 class BackblazeError(RuntimeError):
@@ -201,6 +213,12 @@ def _delete_key_all_versions(key):
 
 
 def sync_script_folder(local_dir, user_id, script_id, prune=False):
+    # Serialize runtime syncs with edit/delete purges for this bot.
+    with _script_lock(user_id, script_id):
+        return _sync_script_folder_locked(local_dir, user_id, script_id, prune)
+
+
+def _sync_script_folder_locked(local_dir, user_id, script_id, prune=False):
     """Upload changed files and optionally remove stale remote file versions."""
     global LAST_ERROR
     if not os.path.isdir(local_dir):
@@ -277,6 +295,12 @@ def download_script_folder(user_id, script_id, dest_dir):
 
 
 def delete_script_folder(user_id, script_id):
+    """Serialize a permanent all-version purge against background sync workers."""
+    with _script_lock(user_id, script_id):
+        return _delete_script_folder_locked(user_id, script_id)
+
+
+def _delete_script_folder_locked(user_id, script_id):
     """Delete every object version belonging to a bot and verify the prefix is empty."""
     try:
         prefix = _prefix(user_id, script_id)
