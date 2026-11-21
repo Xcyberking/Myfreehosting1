@@ -1013,6 +1013,55 @@ def admin_clear_all_data():
 
 
 
+@app.route('/admin/server-info')
+@admin_required
+def admin_server_info():
+    """Return safe telemetry for this Railway container; never expose environment secrets."""
+    try:
+        ps = runner.psutil
+        vm = ps.virtual_memory()
+        disk = ps.disk_usage(UPLOAD_DIR)
+        try:
+            cpu_percent = ps.cpu_percent(interval=0.25)
+        except Exception:
+            cpu_percent = 0
+        railway_keys = (
+            'RAILWAY_PROJECT_NAME', 'RAILWAY_ENVIRONMENT_NAME',
+            'RAILWAY_SERVICE_NAME', 'RAILWAY_DEPLOYMENT_ID',
+            'RAILWAY_REPLICA_ID', 'RAILWAY_REGION', 'RAILWAY_PUBLIC_DOMAIN',
+        )
+        railway = {key: os.environ.get(key, '') for key in railway_keys if os.environ.get(key)}
+        boot = ps.boot_time()
+        return jsonify({
+            'ok': True,
+            'server': {
+                'hostname': __import__('socket').gethostname(),
+                'platform': sys.platform,
+                'python': sys.version.split()[0],
+                'pid': os.getpid(),
+                'cpu_count': ps.cpu_count() or 0,
+                'cpu_percent': cpu_percent,
+                'memory_total': vm.total,
+                'memory_used': vm.used,
+                'memory_available': vm.available,
+                'memory_percent': vm.percent,
+                'disk_total': disk.total,
+                'disk_used': disk.used,
+                'disk_free': disk.free,
+                'disk_percent': disk.percent,
+                'process_count': len(ps.pids()),
+                'boot_time': datetime.utcfromtimestamp(boot).isoformat() + 'Z',
+                'uptime_seconds': max(0, int(time.time() - boot)),
+                'upload_directory': UPLOAD_DIR,
+                'railway': railway,
+                'scope': 'Current Railway service/container only. Other Railway services and workspace billing are not exposed here.'
+            }
+        })
+    except Exception as exc:
+        app.logger.exception('Server telemetry failed')
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+
+
 @app.route('/admin/orphan-processes')
 @admin_required
 def admin_orphan_processes():
@@ -1025,7 +1074,10 @@ def admin_orphan_processes():
             item['bot_name'] = (record or {}).get('name') or 'Untracked / deleted bot'
             item['owner_name'] = ((db.get_user(item['user_id']) or {}).get('name')
                                   or item['user_id'])
-        return jsonify({'ok': True, 'processes': items})
+            item['status_label'] = 'Tracked bot process' if record else 'ORPHAN — database record deleted'
+            item['record_status'] = (record or {}).get('status', 'deleted')
+        return jsonify({'ok': True, 'processes': items, 'count': len(items),
+                        'note': 'Only Python/Node processes attributable to this app uploads directory are listed.'})
     except Exception as exc:
         app.logger.exception('Orphan process scan failed')
         return jsonify({'ok': False, 'error': str(exc)}), 500
