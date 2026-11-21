@@ -487,32 +487,47 @@ def edit_bot(sid):
         source = str(data.get('code', ''))
         if not source.strip() or len(source.encode('utf-8')) > MAX_FILE_SIZE:
             return jsonify({'ok': False, 'error': 'Code empty or exceeds 20 MB.'}), 400
-        was_running = runner.is_running(sid)
-        if was_running:
-            ok, msg = runner.stop_script(sid)
-            if not ok:
-                return jsonify({'ok': False, 'error': msg}), 502
+        # Editing always leaves the bot OFF. Stop every known process first,
+        # then purge every old B2 object version before publishing the replacement.
+        stopped, stop_message = runner.stop_script(sid)
+        if not stopped and stop_message != "Not running":
+            return jsonify({'ok': False, 'error': stop_message}), 502
+
         sdir = runner.get_script_dir(script['user_id'], sid)
+        os.makedirs(sdir, exist_ok=True)
         if not os.path.isfile(os.path.join(sdir, rel)):
             if not storage_helper.download_script_folder(script['user_id'], sid, sdir):
-                return jsonify({'ok': False, 'error': 'Could not restore source from Backblaze B2.'}), 502
-        with open(os.path.join(sdir, rel), 'w', encoding='utf-8') as out:
-            out.write(source)
+                return jsonify({'ok': False, 'error': 'Could not restore existing bot files from Backblaze B2.'}), 502
+
         env_vars = data.get('env_vars') or {}
         if not isinstance(env_vars, dict):
             return jsonify({'ok': False, 'error': 'Environment variables must be JSON object.'}), 400
         env_vars = {str(k): str(v) for k, v in env_vars.items() if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,127}', str(k))}
-        db.update_script(sid, {'env_vars': env_vars, 'updated_at': datetime.utcnow().isoformat()})
-        # Keep the edited copy on Render. If it was running, restart it in the
-        # background; then back up the updated source/session files to Backblaze B2.
-        _queue_bot_deploy(
-            sid, script['user_id'], sdir,
-            file_path=os.path.join(sdir, rel) if was_running else None,
-            file_type='py',
-            env_vars=env_vars,
-        )
-        message = 'Changes saved on Render. Restart and Backblaze B2 backup queued.' if was_running else 'Changes saved on Render. Backblaze B2 backup queued; start the bot when ready.'
-        return jsonify({'ok': True, 'queued': True, 'message': message})
+
+        # Delete all previous versions/delete markers so the old source cannot
+        # be restored after Stop, restart, or a Render redeploy.
+        if not storage_helper.delete_script_folder(script['user_id'], sid):
+            return jsonify({'ok': False, 'error': 'Old cloud versions could not be purged. Edit was not applied; check Backblaze permissions.'}), 502
+
+        with open(os.path.join(sdir, rel), 'w', encoding='utf-8') as out:
+            out.write(source)
+
+        # Force a clean upload of the replacement snapshot. Do not auto-start it.
+        if not storage_helper.sync_script_folder(sdir, script['user_id'], sid, prune=True):
+            return jsonify({'ok': False, 'error': 'New code was saved locally but cloud sync failed. Bot remains OFF; check Backblaze logs and retry.'}), 502
+
+        db.update_script(sid, {
+            'env_vars': env_vars,
+            'updated_at': datetime.utcnow().isoformat(),
+            'running': False,
+            'status': 'stopped',
+            'process_pid': None,
+            'process_group_id': None,
+            'process_started_at': None,
+            'last_start_error': '',
+        })
+        return jsonify({'ok': True, 'queued': False, 'running': False,
+                        'message': 'Updated. Old cloud versions purged, new code backed up, and bot remains OFF. Start it manually when ready.'})
     sdir = runner.get_script_dir(script['user_id'], sid)
     if not os.path.isfile(os.path.join(sdir, script['name'])):
         storage_helper.download_script_folder(script['user_id'], sid, sdir)
@@ -760,21 +775,21 @@ def api_delete(sid):
 
     sdir = os.path.join(UPLOAD_DIR, str(s['user_id']), str(sid))
     try:
-        # Stop and verify the complete process group before deleting files.
-        # Never remove the record/folder when a bot process could still be alive.
+        # Stop and verify the complete process group before deleting any source.
         stopped, stop_message = runner.stop_script(sid)
         if not stopped and stop_message != "Not running":
             return jsonify({'ok': False, 'error': stop_message}), 502
-        # Always inspect/delete the Backblaze B2 prefix, even when the Firestore
-        # storage_path field is blank or stale (older uploads often had this).
+
+        # Purge every version and delete marker, regardless of stale storage_path.
         if not storage_helper.delete_script_folder(s['user_id'], sid):
-            return jsonify({'ok': False, 'error': 'Backblaze B2 files could not be verified as deleted. Bot record was kept; retry after checking Backblaze B2 API key and permissions.'}), 502
+            return jsonify({'ok': False, 'error': 'Cloud source could not be verified as deleted. Bot record was kept; check Backblaze permissions and retry.'}), 502
+
         if os.path.isdir(sdir):
             shutil.rmtree(sdir)
         if os.path.exists(sdir):
-            return jsonify({'ok': False, 'error': 'Temporary Render folder still exists; Firestore record was kept.'}), 500
+            return jsonify({'ok': False, 'error': 'Temporary folder still exists; bot record was kept.'}), 500
         db.delete_script(sid)
-        return jsonify({'ok': True, 'message': 'Bot, Backblaze B2 files and Render temporary files deleted.'})
+        return jsonify({'ok': True, 'message': 'Bot stopped; all cloud versions and local files permanently deleted.'})
     except Exception as exc:
         app.logger.exception("Bot delete failed for %s", sid)
         return jsonify({'ok': False, 'error': f'Delete failed: {type(exc).__name__}: {exc}'}), 500
