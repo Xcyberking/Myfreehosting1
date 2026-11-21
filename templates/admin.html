@@ -41,16 +41,30 @@
 
 {% include '_storage_monitor.html' %}
 
-<!-- ORPHAN / UNTRACKED BOT PROCESSES -->
+<!-- RAILWAY CONTAINER DETAILS -->
+<div class="card" id="serverInfoCard">
+    <div class="row-between">
+        <div>
+            <h3 style="margin:0;">🖥️ Railway server details</h3>
+            <p class="muted small" style="margin:6px 0 0;">Live telemetry for this Railway service/container. Secrets and environment-variable values are never displayed.</p>
+        </div>
+        <button class="btn btn-primary btn-sm" id="refreshServerInfoBtn" onclick="loadServerInfo()">Refresh</button>
+    </div>
+    <div id="serverInfoStatus" class="muted small" style="margin-top:12px;">Loading server details…</div>
+    <div id="serverInfoGrid" class="stats-row" style="margin-top:12px;"></div>
+    <div id="serverInfoMeta" class="muted small" style="margin-top:10px;word-break:break-word;"></div>
+</div>
+
+<!-- ALL BOT PROCESSES, INCLUDING DELETED/ORPHANED RECORDS -->
 <div class="card" id="orphanProcessCard">
     <div class="row-between">
         <div>
-            <h3 style="margin:0;">⚠️ Hidden / untracked running bots</h3>
-            <p class="muted small" style="margin:6px 0 0;">Scan this hosting instance for bot processes that are still running but are missing from the normal bot list.</p>
+            <h3 style="margin:0;">🔎 All running bots on this server</h3>
+            <p class="muted small" style="margin:6px 0 0;">Scans Python/Node processes belonging to this hosting app, including bots whose website/database records or source files were deleted.</p>
         </div>
-        <button class="btn btn-primary btn-sm" id="scanOrphansBtn" onclick="scanOrphanProcesses()">Scan</button>
+        <button class="btn btn-primary btn-sm" id="scanOrphansBtn" onclick="scanOrphanProcesses()">Scan server</button>
     </div>
-    <div id="orphanProcessStatus" class="muted small" style="margin-top:12px;">Tap Scan to find orphan processes on this server.</div>
+    <div id="orphanProcessStatus" class="muted small" style="margin-top:12px;">Tap Scan server to inspect bot processes in this Railway container.</div>
     <div id="orphanProcessList" style="display:flex;flex-direction:column;gap:10px;margin-top:10px;"></div>
 </div>
 
@@ -275,43 +289,94 @@ async function clearAllHostingData() {
 }
 
 
+function formatBytes(value) {
+    const n = Number(value || 0);
+    if (!n) return '0 B';
+    const units = ['B','KB','MB','GB','TB'];
+    const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+    return (n / Math.pow(1024, i)).toFixed(i ? 1 : 0) + ' ' + units[i];
+}
+
+async function loadServerInfo() {
+    const button = document.getElementById('refreshServerInfoBtn');
+    const status = document.getElementById('serverInfoStatus');
+    const grid = document.getElementById('serverInfoGrid');
+    const meta = document.getElementById('serverInfoMeta');
+    if (button) button.disabled = true;
+    status.textContent = 'Reading Railway container metrics…';
+    try {
+        const response = await fetch('/admin/server-info', {cache:'no-store'});
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || 'Server details unavailable');
+        const s = data.server;
+        const cards = [
+            ['CPU', s.cpu_percent + '%', (s.cpu_count || 0) + ' vCPU visible'],
+            ['RAM', formatBytes(s.memory_used), formatBytes(s.memory_total) + ' total · ' + s.memory_percent + '% used'],
+            ['Disk', formatBytes(s.disk_used), formatBytes(s.disk_total) + ' total · ' + s.disk_percent + '% used'],
+            ['Processes', s.process_count, 'Visible in this container'],
+            ['Uptime', Math.floor(s.uptime_seconds / 3600) + 'h ' + Math.floor((s.uptime_seconds % 3600) / 60) + 'm', 'Container boot time'],
+            ['Python', s.python, s.platform]
+        ];
+        grid.replaceChildren();
+        for (const [label, value, hint] of cards) {
+            const card = document.createElement('div');
+            card.className = 'stat-card';
+            const body = document.createElement('div');
+            body.className = 'stat-body';
+            const name = document.createElement('div'); name.className = 'label'; name.textContent = label;
+            const val = document.createElement('div'); val.className = 'value'; val.textContent = value;
+            const small = document.createElement('div'); small.className = 'muted small'; small.textContent = hint;
+            body.append(name, val, small); card.append(body); grid.append(card);
+        }
+        const railway = Object.entries(s.railway || {}).map(([k,v]) => k.replace('RAILWAY_','') + ': ' + v);
+        meta.textContent = 'Host: ' + s.hostname + ' · PID: ' + s.pid + ' · Boot: ' + s.boot_time +
+            (railway.length ? ' · ' + railway.join(' · ') : '') + ' · ' + s.scope;
+        status.textContent = 'Live container telemetry refreshed.';
+    } catch (e) {
+        status.textContent = 'Server details error: ' + e.message;
+    } finally {
+        if (button) button.disabled = false;
+    }
+}
+
 async function scanOrphanProcesses() {
     const button = document.getElementById('scanOrphansBtn');
     const status = document.getElementById('orphanProcessStatus');
     const list = document.getElementById('orphanProcessList');
     button.disabled = true;
-    status.textContent = 'Scanning this server…';
+    status.textContent = 'Scanning Python/Node bot processes in this Railway container…';
     list.replaceChildren();
     try {
         const response = await fetch('/admin/orphan-processes', {cache:'no-store'});
         const data = await response.json();
         if (!response.ok || !data.ok) throw new Error(data.error || 'Scan failed');
         if (!data.processes.length) {
-            status.textContent = 'No untracked bot processes found on this hosting instance.';
+            status.textContent = 'No bot processes attributable to this app were found in this container.';
             return;
         }
-        status.textContent = data.processes.length + ' untracked process group(s) found.';
+        status.textContent = data.count + ' bot process group(s) found. This list includes tracked and deleted/untracked bots.';
         for (const item of data.processes) {
             const card = document.createElement('div');
             card.style.cssText = 'padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--bg-1);';
             const title = document.createElement('strong');
-            title.textContent = item.bot_name + (item.known_record ? '' : ' · DB record missing');
+            title.textContent = item.bot_name + (item.known_record ? ' · ' + item.record_status : ' · DELETED FROM PANEL');
             const detail = document.createElement('div');
             detail.className = 'muted small';
             detail.style.cssText = 'margin:6px 0;word-break:break-all;';
             detail.textContent = 'Owner: ' + item.owner_name + ' (' + item.user_id + ') · Bot ID: ' + item.script_id +
                 ' · PID: ' + item.pid + ' · Group: ' + (item.process_group_id ?? 'N/A') +
-                ' · Processes: ' + item.processes.join(', ');
+                ' · Processes: ' + item.processes.join(', ') + ' · Runtime: ' + (item.process_names || []).join(', ');
             const command = document.createElement('div');
             command.className = 'muted small';
             command.style.cssText = 'margin-bottom:8px;word-break:break-all;';
-            command.textContent = item.command || '';
+            command.textContent = 'Command: ' + (item.command || '') +
+                ((item.working_directories || []).length ? ' · CWD: ' + item.working_directories.join(', ') : '');
             const stop = document.createElement('button');
             stop.className = 'btn btn-danger btn-sm';
             stop.style.width = '100%';
-            stop.textContent = 'Stop this hidden bot';
+            stop.textContent = 'Stop this bot process';
             stop.addEventListener('click', async () => {
-                if (!confirm('Stop this process group? Only processes verified as belonging to this app uploads folder will be stopped.')) return;
+                if (!confirm('Stop this process group? Only a process group re-verified as belonging to this hosting app will be stopped.')) return;
                 stop.disabled = true;
                 try {
                     const r = await fetch('/admin/orphan-processes/stop', {
@@ -340,6 +405,8 @@ async function scanOrphanProcesses() {
         button.disabled = false;
     }
 }
+
+loadServerInfo();
 
 let adminCurrentLogSid = null;
 let adminLogRefreshInterval = null;
